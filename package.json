@@ -1,0 +1,12 @@
+{
+  "name": "cognitive-wedge",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Cognitive Wedge self-serve prototype: a gated, five-state agent program on the Claude API",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
