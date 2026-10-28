@@ -1,0 +1,15 @@
+{
+  "_note": "STARTER LIST. The spec requires every accepted task type to be pre-tested with the Performer prompt. Edit this list after your team has tested each entry; the Performer runs only these.",
+  "types": [
+    "Client proposal",
+    "Quarterly narrative",
+    "Stakeholder update",
+    "Roadmap memo",
+    "Performance review",
+    "Budget justification",
+    "Policy or process document",
+    "Project plan",
+    "Meeting briefing",
+    "Design or technical brief"
+  ]
+}

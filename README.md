@@ -1,49 +1,105 @@
-# Cognitive Wedge — local prototype (v0.3)
+# Cognitive Wedge, v2 prototype
 
-Runs entirely on your machine. The only outbound traffic is each agent turn, sent to the Claude API with your own key.
+A self-serve session that decides what a person does and what they hand to an AI agent. One chat, six gated states, a one-page report, a staff-only readiness score and a staff dashboard.
 
-## Run it
+It sits in front of the native AI platform. It does not coach people to do their current role better, teach prompting, or build the platform.
 
-Double-click `start.command`. The first run asks for your API key and saves it to `.env`. Your browser opens http://localhost:3000.
+## What is in this version
 
-## What's in here
-
-| File | What it is |
+| Area | What it does |
 |---|---|
-| `server.js` | Static server + API. `/api/sample` forwards a turn list to the Claude API (the leading module prompt becomes the system prompt) and streams the reply back; on Reconstruction turns it enables the API's web search tool. `/api/session/:id` reads and writes a session. `/api/session/:id/documents` stores files the participant attaches (PDFs go to the API as documents; Word and text as text). `/api/session/:id/artifacts` saves the build's output as .md and .html. No dependencies. |
-| `public/index.html` | The whole prototype: five-state machine, module prompts (v0.3), gate checks on the stored record, the reassure/advise classifier, the feeling and tell-tale checks, build timers, the record rail, document intake, Export run, and dev controls. |
-| `data/<session>.json` | One file per session: state, every record (versioned, with `prompt_version`), transcript, engine log. |
-| `data/<session>/` | That session's attached documents and saved artifacts. |
+| States | Orientation, Onboarding, Rupture, Deconstruction, Reconstruction, Re-entry. A state ends only when its gate passes on the stored records. No skipping, no going back. |
+| Orientation | Fixed script, rendered by the server (the agent cannot paraphrase it). States the objective, steps, minutes and the data notice, and confirms the participant understood. |
+| Prompts | `prompts/` holds the spec's prompts verbatim, one file per module. Edit a file, restart, done. |
+| Time | Budgets 2 / 7 / 8 / 13 / 35 minutes (about 30 to the build, 65 total). Idle gaps over 30 minutes do not count. Fast mode starts when under 30% of a state's budget is left. |
+| Classifier | A second small model call checks every Rupture and Deconstruction turn (reassures, advises, steers). A bad turn is regenerated twice, then replaced by a fixed question. |
+| Records | The agent emits JSON in a `record` fence. The server strips it from the chat and stores it as append-only, versioned rows. |
+| Tell-tale check | Rejected if it has no observable action or uses notice, feel, resist or mindful. |
+| Resume | One email after 30 minutes idle, one after 24 hours, never a third. |
+| Report | One page, built from the participant's own words. v1 at the end of Reconstruction, v2 to v4 after each check-in. Print to PDF from the browser. |
+| Check-ins | Emailed magic links on day 3, 10 and 30. Short Witness sessions. |
+| Readiness score | Rubric v0 (100 points), bands Strong 75+, Watch 55 to 74, At risk under 55, outlook after check-ins. Staff only. |
+| Dashboard | `/staff`. Funnel and time, gate friction, results, re-entry, readiness, participants. Aggregates carry no free text. Participant pages show it and each open is logged. |
+| Privacy | Staff allowlist with one-time sign-in links. Retention purge (default 12 months). A participant can delete their data from the session page. |
 
-## Settings (`.env`)
+## How this differs from v0.3 on `main`
 
-| Variable | Default | Role |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | — | required |
-| `PORT` | `3000` | |
-| `MODEL_DEFAULT` | `claude-sonnet-5-5` | the agent |
-| `MODEL_QUICK` | `claude-haiku-5-5` | the turn classifier (falls back to the agent model if it fails) |
-| `WEB_SEARCH_MAX_USES` | `8` | searches allowed per agent turn in Reconstruction ($10 per 1,000 searches) |
+v2 is rebuilt from the updated spec, not patched from the v0.3 code, so the two do not share files. `main` is untouched; this lives on the `v2` branch.
 
-## v0.3 changes
+Carried over: the Railway deploy (`railway.json`, now health-checked at `/healthz`), the model defaults, the per-turn classifier, the tell-tale and feeling checks.
 
-- Module 1: the derived library's first entry is the identity task, as an artifact or, where the task is a presence, as a live eight-to-ten-turn exchange (an "effect"). The feeling line on the witness card must be a feeling; the gate checks it.
-- Module 2: questions are asked in terms of the participant's task first; archaeology is capped at four steps chosen by them; "present/gone" is explained.
-- Module 3: the agent has web search and the participant's documents; the artifact is written as a file and saved; a declined or shrunk build is proposed again once, then recorded as a ledger entry and `exceeded_alone:false`, and the module continues. A second "stop" closes the session.
-- Engine: performer output captured from the turn that contains it; modules advance only when the agent emits `module_close`; classifier falls back to the agent model.
+Changed: SQLite instead of one JSON file per session; magic-link sign-in and a staff allowlist instead of a shared team password; a server-side state machine with gates checked on stored records; Orientation, time budgets, fast mode, resume emails, the one-page report, the readiness score and the dashboard (all new in this round).
 
-## Dev controls (right rail)
+**Not carried over from v0.3** (going by its README; confirm what you still want): web search during Reconstruction, attaching PDF or Word documents, saving the build as .md and .html files, Export run, the developer rail that jumps between states, and the shared-password gate. These are the first things to port if you want parity.
 
-Jump to any state, open a re-entry checkpoint, Export run (Markdown report), Reset session, Show instruction (the exact text sent to the agent).
+## Run it locally in two minutes (no API key)
 
-## Hosting for a team (Railway)
+```bash
+npm install
+MOCK_LLM=1 DEV_MODE=1 STAFF_EMAILS=you@example.com npm start
+```
 
-The repo carries a `Dockerfile` and `railway.json`. On Railway: New Project → Deploy from GitHub repo → this repo. Then in the service:
+Open http://localhost:3000. In dev mode links are shown on screen and at `/dev/outbox`. `MOCK_LLM=1` swaps in a scripted stand-in so the team can click through every state and the dashboard before spending any tokens.
 
-1. **Variables**: `ANTHROPIC_API_KEY`, `TEAM_PASSWORD` (what the team types to get in), `DATA_DIR=/data`.
-2. **Volume**: add one and mount it at `/data`, so sessions, documents and artifacts survive redeploys.
-3. **Settings → Networking**: generate a public domain. That's the link to share.
+To skip waiting for check-ins: `curl -X POST localhost:3000/dev/advance -H 'Content-Type: application/json' -d '{"days":3}'` then open the day-3 link from `/dev/outbox`.
 
-Everyone who opens the link sees a password screen; after that the app behaves as it does locally. Each run is saved under its participant's name and date and can be reopened from the session picker or exported. To pull all data down, use Railway's volume browser or the `/api/sessions` and `/api/session/:id` endpoints while signed in.
+## Run it with Claude
 
-Spending is on your key. `MAX_TURNS_PER_SESSION` (default 400) and `WEB_SEARCH_MAX_USES` (default 8 per turn) are the caps.
+```bash
+cp .env.example .env     # fill in ANTHROPIC_API_KEY, BASE_URL, STAFF_EMAILS, SMTP_URL
+node --env-file=.env server.js
+```
+
+## Deploy
+
+GitHub stores the code. The app needs a Node host with a persistent disk, because it keeps a SQLite file. GitHub Pages cannot run it.
+
+- **Railway** (what v0.3 used): connect the repo, pick the `v2` branch, add a volume mounted at `/data`, set the variables from `.env.example`.
+- **Any container host** (Render, Fly.io, Azure, AWS): build the `Dockerfile`, mount a volume at `/data`, set the environment variables from `.env.example`, expose port 3000.
+- **Single process.** Run one instance. Rate limits and the double-submit lock are in memory.
+- **HTTPS.** Set `BASE_URL` to the public https address so cookies are marked Secure.
+
+CI (`.github/workflows/ci.yml`) runs the tests on every push.
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the whole six-state flow, check-ins on days 3, 10 and 30, resume emails, the classifier fallback, deletion, report trimming, the tell-tale check, gates, the score, and renders every dashboard view against real stored data. All with the scripted agent.
+
+## Read this before the first live run
+
+1. **The real agent has not been run yet.** Everything above was tested with the scripted stand-in. The first live session will show how well Claude follows the record format and the prompts. Run two or three yourselves first and read the `records` table. Rejections show up in the dashboard's Gate friction view.
+2. **The task library is a starter list** in `data/task_library.json`. The spec requires every type to be pre-tested with the Performer prompt. Test each, then edit the list.
+3. **Implementation choices not in the spec text.**
+   - The Deconstruction gate also requires the `read_back` record, because it is the closing step and the module would otherwise hand over before it.
+   - The record format (`src/prompts.js`, `RECORD_FORMAT`) is added to every prompt so the gates can read what the agent produces.
+   - After a state change the next module speaks first, so the participant is not left at a blank box.
+   - Four score signals are reported by the agent (`felt_reprompts`, `reproposals`, `read_back.done`, `linked_row`). Check them against transcripts on the first cohort.
+   - The report header shows the participant ID and track. The spec lists a name; none is collected.
+4. **Platform link.** Day 30 asks whether the build shipped and the operating model held. To also ask whether delegated tasks are being done on the platform, set `PLATFORM_CHECK=1` and `PLATFORM_NAME`. Off until the link is confirmed.
+5. **The data notice** says nothing is used to assess the participant or their job. Confirm that with HR or legal before launch (`src/config.js`).
+6. **The score is a prior, not a prediction.** The calibration plan is in the spec.
+7. `node:sqlite` is marked experimental in Node 22. It works, and removes a native dependency. Swap in `better-sqlite3` if your host prefers.
+
+## Layout
+
+```
+server.js            routes
+src/engine.js        turns, gates, transitions, check-ins
+src/gates.js         state gates and record checks
+src/prompts.js       builds each system prompt
+src/llm.js           Claude calls and the classifier
+src/mock-llm.js      scripted stand-in agent
+src/score.js         readiness rubric v0
+src/report.js        one-page report
+src/staff-data.js    rows for the dashboard
+src/scheduler.js     resume emails, check-in emails, retention
+prompts/             the spec's prompts, verbatim
+public/              participant pages and the dashboard
+test/                tests
+```
+
+Spec: Cognitive Wedge, Self-Serve Prototype: Agent Prompts and System Spec (v0.1, with the changes listed in the Alignment Summary).

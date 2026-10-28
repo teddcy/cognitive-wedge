@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cognitive Wedge session</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="row"><span class="brand">Cognitive Wedge</span><span class="clock" id="clock" aria-live="off"></span></div>
+    <div class="steps" id="steps" aria-label="Progress"></div>
+  </header>
+  <div id="log" role="log" aria-live="polite"></div>
+  <form class="compose" id="f">
+    <textarea id="t" rows="1" placeholder="Type your answer" aria-label="Your answer"></textarea>
+    <button type="submit" id="send">Send</button>
+  </form>
+  <footer class="tools" id="tools"></footer>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let S = null, left = null, tickAt = 0;
+
+function bubble(role, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (role === 'user' ? 'user' : role === 'sys' ? 'sys' : '');
+  d.textContent = text;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+  return d;
+}
+function paint(s) {
+  S = s; left = s.minutes_left; tickAt = Date.now();
+  $('steps').innerHTML = s.steps.map((n, i) => `<div class="step ${i + 1 === s.step ? 'on' : i + 1 < s.step ? 'done' : ''}">${i + 1}. ${n}</div>`).join('');
+  const tools = [];
+  if (s.reports.length) {
+    const v = s.reports[s.reports.length - 1].version;
+    tools.push(`<a href="/report/${v}" target="_blank" rel="noopener">Your one-page report (v${v})</a>`);
+  }
+  tools.push('<button type="button" class="ghost" id="del">Delete my data</button>');
+  $('tools').innerHTML = tools.join(' ');
+  $('del').onclick = async () => {
+    if (!confirm('Delete everything you have entered? This cannot be undone.')) return;
+    await fetch('/api/me/delete', { method: 'POST' });
+    location.href = '/';
+  };
+  const waiting = s.state === 'REENTRY' && !s.checkin_day;
+  const off = s.closed || waiting;
+  $('t').disabled = $('send').disabled = off;
+  $('f').style.display = off ? 'none' : 'flex';
+  clock();
+}
+function clock() {
+  if (!S || S.budget == null || S.closed) { $('clock').textContent = ''; return; }
+  const m = Math.max(0, left - (Date.now() - tickAt) / 60000);
+  $('clock').textContent = `${S.label}: about ${Math.ceil(m)} min left in this step`;
+}
+setInterval(clock, 15000);
+
+async function load() {
+  const r = await fetch('/api/session');
+  if (r.status === 401) { location.href = '/'; return; }
+  const j = await r.json();
+  $('log').innerHTML = '';
+  j.messages.forEach((m) => bubble(m.role, m.text));
+  paint(j.session);
+  const s = j.session;
+  if (s.closed) bubble('sys', s.exit_reason === 'distress' ? 'This session is closed. Your record is saved. You can come back any time.' : s.exit_reason === 'complete' ? 'That is day 30. The statement is yours.' : 'This session is closed. Your record is saved.');
+  else if (s.state === 'REENTRY' && !s.checkin_day) {
+    const next = s.checkins.find((c) => !c.completed_at);
+    bubble('sys', next ? `Your next check-in is on ${new Date(next.scheduled_for).toLocaleDateString()}. We will email you the link.` : 'All check-ins are done.');
+  }
+}
+
+$('t').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('f').requestSubmit(); } });
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const text = $('t').value.trim();
+  if (!text) return;
+  $('t').value = ''; $('send').disabled = true;
+  bubble('user', text);
+  const typing = bubble('sys', 'Thinking…'); typing.classList.add('typing');
+  try {
+    const r = await fetch('/api/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const j = await r.json();
+    typing.remove();
+    if (!r.ok) throw new Error(r.status === 429 ? 'One moment: the last answer is still being processed.' : 'Something went wrong. Your answer is saved. Please send it again.');
+    j.messages.forEach((m) => bubble('assistant', m.text));
+    paint(j.session);
+    if (j.session.state === 'REENTRY') await load();
+  } catch (err) {
+    typing.remove(); bubble('sys', err.message);
+  } finally { if (!S?.closed) $('send').disabled = false; $('t').focus(); }
+});
+load();
+</script>
+</body>
+</html>
