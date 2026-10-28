@@ -1,6 +1,5 @@
-.env
-.env.*
-data/
-versions/
 node_modules/
-.DS_Store
+data/*.db
+data/*.db-*
+.env
+*.log

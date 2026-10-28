@@ -1,225 +1,170 @@
-// Cognitive Wedge — local server.
-// Serves public/, proxies agent calls to the Claude API with YOUR key, stores sessions, documents and artifacts under ./data.
-// No dependencies beyond Node 18+.
-'use strict';
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
+import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config } from './src/config.js';
+import { openDb, get, all, run, deleteParticipant } from './src/db.js';
+import { advance, now, MIN, HOUR, DAY } from './src/clock.js';
+import {
+  createToken, redeemToken, startAuthSession, readCookies, setCookie, clearCookie,
+  requireParticipant, requireStaff, limited, PARTICIPANT_TTL, STAFF_TTL,
+} from './src/auth.js';
+import {
+  createParticipant, createSession, sessionForParticipant, handleUserMessage, summary, transcript,
+  openCheckin, sendResume, getSession,
+} from './src/engine.js';
+import { sendMail, outbox } from './src/mailer.js';
+import { renderStored, reportVersions } from './src/report.js';
+import { dashboardData, participantDetail } from './src/staff-data.js';
+import { startScheduler, tick } from './src/scheduler.js';
+import { usingMock } from './src/llm.js';
 
-// ---- config ---------------------------------------------------------------
-try { // optional .env next to this file: KEY=value lines
-  for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
-  }
-} catch (e) {}
-const PORT = Number(process.env.PORT || 3000);
-const KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODELS = { // tiers mirror the prototype: default = the agent, quick = the classifier
-  default: process.env.MODEL_DEFAULT || 'claude-sonnet-5-5',
-  complex: process.env.MODEL_COMPLEX || 'claude-opus-5-5',
-  quick:   process.env.MODEL_QUICK   || 'claude-haiku-5-5',
-};
-const WEB_SEARCH_MAX_USES = Number(process.env.WEB_SEARCH_MAX_USES || 8); // per agent turn; $10 per 1,000 searches
-const TEAM_PASSWORD = process.env.TEAM_PASSWORD || '';          // when set, the whole app sits behind this shared password
-const MAX_TURNS_PER_SESSION = Number(process.env.MAX_TURNS_PER_SESSION || 400); // agent calls per session; a cost cap
-const HOST = process.env.HOST || (process.env.TEAM_PASSWORD || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
-const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
-const PUBLIC = path.join(__dirname, 'public');
-fs.mkdirSync(DATA, { recursive: true });
+const here = path.dirname(fileURLToPath(import.meta.url));
+const pub = (f) => path.join(here, 'public', f);
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-// ---- helpers --------------------------------------------------------------
-const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
-const readBody = (req, max = 40e6) => new Promise((ok, no) => { const chunks = []; let n = 0; req.on('data', c => { n += c.length; if (n > max) { no(new Error('too large')); req.destroy(); } chunks.push(c); }); req.on('end', () => ok(Buffer.concat(chunks))); req.on('error', no); });
-const safeId = id => /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : null;
-const crypto = require('crypto');
-const authToken = () => crypto.createHmac('sha256', 'cw-auth').update(TEAM_PASSWORD).digest('hex').slice(0, 40);
-function authed(req) {
-  if (!TEAM_PASSWORD) return true;
-  const c = req.headers.cookie || ''; const m = c.match(/(?:^|;\s*)cw_auth=([a-f0-9]+)/);
-  return !!m && m[1] === authToken();
-}
-const turnCounts = new Map(); // session id → agent calls this process lifetime (the session file holds the durable count)
-const safeName = n => String(n || 'file').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80);
-const sessionDir = id => path.join(DATA, id);
-const sessionFile = id => path.join(DATA, id + '.json');
+export function createApp() {
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+  app.use(express.json({ limit: '32kb' }));
+  app.use((req, res, next) => {
+    res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY' });
+    next();
+  });
+  app.use('/assets', express.static(path.join(here, 'public', 'assets'), { maxAge: '1h' }));
 
-// ---- documents: stored per session; PDFs go to the API as document blocks, everything else as text
-function docMeta(id) { const f = path.join(sessionDir(id), 'documents.json'); try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return []; } }
-function saveDocMeta(id, list) { fs.mkdirSync(sessionDir(id), { recursive: true }); fs.writeFileSync(path.join(sessionDir(id), 'documents.json'), JSON.stringify(list, null, 1)); }
-function docxToText(file) {
-  // .docx is a zip; macOS and Linux ship unzip. Pull the body XML and strip the tags.
-  const xml = execFileSync('unzip', ['-p', file, 'word/document.xml'], { maxBuffer: 50e6 }).toString('utf8');
-  return xml.replace(/<\/w:p>/g, '\n').replace(/<w:tab\/>/g, '\t').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/\n{3,}/g, '\n\n').trim();
-}
-function documentBlocks(id) {
-  const blocks = []; const notes = [];
-  for (const d of docMeta(id)) {
-    const file = path.join(sessionDir(id), d.stored);
-    if (!fs.existsSync(file)) continue;
-    if (d.kind === 'pdf') { blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: fs.readFileSync(file).toString('base64') }, title: d.name }); notes.push(d.name + ' (PDF, attached as a document)'); }
-    else { const text = fs.readFileSync(file, 'utf8').slice(0, 400000); blocks.push({ type: 'text', text: 'DOCUMENT "' + d.name + '" (supplied by the participant):\n\n' + text }); notes.push(d.name + ' (' + text.length + ' chars)'); }
-  }
-  return { blocks, notes };
-}
+  app.get('/healthz', (req, res) => res.json({ ok: true, mock: usingMock(), dev: config.devMode }));
 
-// ---- Claude API -------------------------------------------------------------
-// The page sends a turn list; the leading user turn is the module instruction and becomes the system prompt.
-async function sample(req, res, body) {
-  if (!KEY) return json(res, 401, { error: 'ANTHROPIC_API_KEY is not set' });
-  const turns = Array.isArray(body.turns) ? body.turns : [];
-  if (!turns.length) return json(res, 400, { error: 'no turns' });
-  let system = '';
-  let messages = turns.map(t => ({ role: t.role === 'assistant' ? 'assistant' : 'user', content: String(t.content || '') }));
-  if (messages.length > 1 && messages[0].role === 'user') { system = messages[0].content; messages = messages.slice(1); }
-  const merged = [];
-  for (const m of messages) { const last = merged[merged.length - 1]; if (last && last.role === m.role) last.content += '\n\n' + m.content; else merged.push({ ...m }); }
-  if (merged[0] && merged[0].role !== 'user') merged.unshift({ role: 'user', content: '[Begin.]' });
+  // ---------- participant ----------
+  app.get('/', (req, res) => res.sendFile(pub('index.html')));
+  app.get('/chat', (req, res) => res.sendFile(pub('chat.html')));
+  app.get('/config.json', (req, res) => res.json({ agentName: config.agentName, dev: config.devMode, mock: usingMock() }));
 
-  // Participant documents ride on the first user turn as content blocks (PDFs as documents, text inline).
-  const sid = body.session && safeId(body.session);
-  if (sid && body.documents) {
-    const { blocks } = documentBlocks(sid);
-    if (blocks.length) merged[0] = { role: 'user', content: [...blocks, { type: 'text', text: merged[0].content }] };
-  }
+  app.post('/api/start', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const track = req.body?.track === 'personal' ? 'personal' : 'commercial';
+    if (!EMAIL.test(email)) return res.status(400).json({ error: 'bad_email' });
+    if (limited(`ip:${req.ip}`, 20) || limited(`mail:${email}`, 5)) return res.status(429).json({ error: 'slow_down' });
+    const p = createParticipant(email, track);
+    let s = sessionForParticipant(p.id);
+    if (!s) s = getSession(createSession(p.id));
+    const token = createToken({ participantId: p.id, sessionId: s.id, purpose: 'start' });
+    const link = `${config.baseUrl}/s/${token}`;
+    await sendMail({ sessionId: s.id, to: email, kind: 'start', subject: 'Your Cognitive Wedge link', text: 'Use this link to start, or to pick up where you left off.', link });
+    res.json({ ok: true, ...(config.devMode ? { devLink: link } : {}) });
+  });
 
-  if (sid && body.modelTier !== 'quick') {
-    let n = 0; try { n = JSON.parse(fs.readFileSync(sessionFile(sid), 'utf8')).turns.filter(t => t.role === 'assistant').length; } catch (e) {}
-    if (n >= MAX_TURNS_PER_SESSION) return json(res, 429, { error: 'This session has reached its limit of ' + MAX_TURNS_PER_SESSION + ' agent turns.' });
-  }
-  const model = MODELS[body.modelTier] || MODELS.default;
-  const payload = { model, max_tokens: body.modelTier === 'quick' ? 800 : 6000, stream: true, ...(system ? { system } : {}), messages: merged };
-  if (body.webSearch) payload.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: WEB_SEARCH_MAX_USES }];
+  app.get('/s/:token', async (req, res) => {
+    const t = redeemToken(req.params.token);
+    if (!t || t.purpose === 'staff') return res.status(400).send('This link is not valid or has expired. Request a new one from the start page.');
+    const id = startAuthSession('participant', t.participant_id, PARTICIPANT_TTL);
+    setCookie(res, 'wid', id, PARTICIPANT_TTL);
+    try {
+      if (t.purpose === 'checkin') await openCheckin(t.session_id, t.day);
+    } catch (e) { console.error('openCheckin:', e.message); }
+    res.redirect('/chat');
+  });
 
-  const ac = new AbortController();
-  req.on('close', () => ac.abort());
-  let upstream;
-  try {
-    upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', signal: ac.signal,
-      headers: { 'content-type': 'application/json', 'x-api-key': KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify(payload),
+  app.get('/api/session', requireParticipant, async (req, res) => {
+    const s = sessionForParticipant(req.participantId);
+    if (!s) return res.status(404).json({ error: 'no_session' });
+    const p = get('SELECT label,track FROM participants WHERE id=?', req.participantId);
+    if (s.state === 'REENTRY' && !s.checkin_day) {
+      try { await openCheckin(s.id); } catch (e) { console.error('openCheckin:', e.message); }
+    }
+    res.json({ session: summary(s.id), messages: transcript(s.id), participant: p, agentName: config.agentName });
+  });
+
+  app.post('/api/message', requireParticipant, async (req, res) => {
+    const s = sessionForParticipant(req.participantId);
+    if (!s) return res.status(404).json({ error: 'no_session' });
+    try {
+      res.json(await handleUserMessage(s.id, req.body?.text));
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error('message error:', e);
+      res.status(500).json({ error: 'agent_error', detail: config.devMode ? e.message : undefined });
+    }
+  });
+
+  app.get('/report/:version', requireParticipant, (req, res) => {
+    const s = sessionForParticipant(req.participantId);
+    const html = s && renderStored(s.id, Number(req.params.version));
+    if (!html) return res.status(404).send('No such report version.');
+    res.type('html').send(html);
+  });
+
+  app.post('/api/me/delete', requireParticipant, (req, res) => {
+    deleteParticipant(req.participantId);
+    clearCookie(res, 'wid');
+    res.json({ ok: true });
+  });
+
+  // ---------- staff ----------
+  app.get('/staff/login', (req, res) => res.sendFile(pub('staff-login.html')));
+  app.post('/api/staff/login', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!EMAIL.test(email) || limited(`staff:${req.ip}`, 10)) return res.status(400).json({ ok: true });
+    let devLink;
+    if (config.staffEmails.includes(email)) {
+      const token = createToken({ staffEmail: email, purpose: 'staff', ttlMs: 15 * MIN });
+      const link = `${config.baseUrl}/staff/auth/${token}`;
+      await sendMail({ to: email, kind: 'staff', subject: 'Cognitive Wedge staff sign-in', text: 'This link signs you in for 8 hours and works once.', link });
+      if (config.devMode) devLink = link;
+    }
+    res.json({ ok: true, ...(devLink ? { devLink } : {}) }); // same answer for every address
+  });
+  app.get('/staff/auth/:token', (req, res) => {
+    const t = redeemToken(req.params.token);
+    if (!t || t.purpose !== 'staff' || !config.staffEmails.includes(t.staff_email)) return res.status(400).send('This link is not valid or has expired.');
+    setCookie(res, 'wst', startAuthSession('staff', t.staff_email, STAFF_TTL), STAFF_TTL);
+    res.redirect('/staff');
+  });
+  app.get('/staff', requireStaff, (req, res) => res.sendFile(pub('dashboard.html')));
+  app.get('/api/staff/data', requireStaff, (req, res) => res.json(dashboardData()));
+  app.get('/api/staff/participant/:sid', requireStaff, (req, res) => {
+    const d = participantDetail(req.params.sid);
+    if (!d) return res.status(404).json({ error: 'not_found' });
+    const s = getSession(req.params.sid);
+    run('INSERT INTO access_log (staff_email,participant_id,created_at) VALUES (?,?,?)', req.staffEmail, s.participant_id, now());
+    res.json(d);
+  });
+  app.get('/staff/report/:sid/:version', requireStaff, (req, res) => {
+    const html = renderStored(req.params.sid, Number(req.params.version));
+    if (!html) return res.status(404).send('No such report.');
+    const s = getSession(req.params.sid);
+    run('INSERT INTO access_log (staff_email,participant_id,created_at) VALUES (?,?,?)', req.staffEmail, s.participant_id, now());
+    res.type('html').send(html);
+  });
+
+  // ---------- dev helpers (DEV_MODE only) ----------
+  if (config.devMode) {
+    app.get('/dev/outbox', (req, res) => {
+      const rows = outbox();
+      res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Dev outbox</title><body style="font:14px system-ui;max-width:760px;margin:24px auto;padding:0 16px"><h1>Dev outbox</h1><p>Emails are not sent in dev mode. Click a link to act as that recipient.</p>${rows.map((r) => `<p><b>${r.kind}</b> to ${r.to_addr}<br>${r.link ? `<a href="${r.link}">${r.link}</a>` : ''}</p>`).join('') || '<p>Empty.</p>'}</body>`);
     });
-  } catch (e) { return json(res, 502, { error: 'could not reach the Claude API: ' + e.message }); }
-  if (!upstream.ok) { const t = await upstream.text().catch(() => ''); console.error('Claude API', upstream.status, t.slice(0, 300)); return json(res, upstream.status, { error: 'Claude API ' + upstream.status + ': ' + t.slice(0, 500) }); }
-
-  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache', 'x-model': model });
-  const reader = upstream.body.getReader(); const dec = new TextDecoder(); let buf = '';
-  const sources = new Map(); let searches = 0; let blockType = null;
-  try {
-    while (true) {
-      const { done, value } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i; while ((i = buf.indexOf('\n\n')) >= 0) {
-        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
-        const line = chunk.split('\n').find(l => l.startsWith('data:')); if (!line) continue;
-        let ev; try { ev = JSON.parse(line.slice(5)); } catch (e) { continue; }
-        if (ev.type === 'content_block_start') {
-          blockType = ev.content_block && ev.content_block.type;
-          if (blockType === 'server_tool_use') { searches++; res.write('\n[searching…]\n'); }
-          if (blockType === 'web_search_tool_result' && Array.isArray(ev.content_block.content)) for (const r of ev.content_block.content) if (r.url) sources.set(r.url, r.title || r.url);
-        } else if (ev.type === 'content_block_delta' && ev.delta) {
-          if (ev.delta.type === 'text_delta' && ev.delta.text) res.write(ev.delta.text);
-          else if (ev.delta.type === 'citations_delta' && ev.delta.citation && ev.delta.citation.url) sources.set(ev.delta.citation.url, ev.delta.citation.title || ev.delta.citation.url);
-        } else if (ev.type === 'error') { console.error('API stream error (' + model + '):', JSON.stringify(ev.error)); }
-      }
-    }
-  } catch (e) {} finally {
-    if (sources.size) { res.write('\n\nSources (' + searches + ' search' + (searches === 1 ? '' : 'es') + '):\n' + [...sources].map(([u, t]) => '- ' + t + ' — ' + u).join('\n')); }
-    res.end();
+    // Move the app clock forward so a tester does not wait days for a check-in.
+    app.post('/dev/advance', async (req, res) => {
+      const days = Number(req.body?.days || 0), minutes = Number(req.body?.minutes || 0);
+      advance(days * DAY + minutes * MIN);
+      await tick();
+      res.json({ ok: true });
+    });
   }
+
+  return app;
 }
 
-// ---- artifacts: the build's output, saved as a file the participant can download
-function saveArtifact(id, body) {
-  const dir = path.join(sessionDir(id), 'artifacts'); fs.mkdirSync(dir, { recursive: true });
-  const n = fs.readdirSync(dir).filter(f => f.endsWith('.md')).length + 1;
-  const base = 'artifact-' + String(n).padStart(2, '0');
-  const md = String(body.markdown || '');
-  fs.writeFileSync(path.join(dir, base + '.md'), md);
-  const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  // small markdown → html: headings, lists, tables, bold, paragraphs
-  const html = md.split(/\n{2,}/).map(block => {
-    const b = block.trim(); if (!b) return '';
-    if (/^\|.*\|$/m.test(b)) { const rows = b.split('\n').filter(r => r.trim().startsWith('|') && !/^\|[\s:|-]+\|$/.test(r.trim())); return '<table>' + rows.map((r, i) => '<tr>' + r.trim().slice(1, -1).split('|').map(c => (i ? '<td>' : '<th>') + inline(c.trim()) + (i ? '</td>' : '</th>')).join('') + '</tr>').join('') + '</table>'; }
-    const h = b.match(/^(#{1,4})\s+(.*)$/); if (h && !b.includes('\n')) return '<h' + h[1].length + '>' + inline(h[2]) + '</h' + h[1].length + '>';
-    if (/^(\d+\.|[-*])\s/.test(b)) { const ol = /^\d+\./.test(b); return (ol ? '<ol>' : '<ul>') + b.split('\n').map(l => '<li>' + inline(l.replace(/^(\d+\.|[-*])\s+/, '')) + '</li>').join('') + (ol ? '</ol>' : '</ul>'); }
-    return '<p>' + inline(b).replace(/\n/g, '<br>') + '</p>';
-  }).join('\n');
-  function inline(s) { return esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\*(.+?)\*/g, '<i>$1</i>').replace(/`(.+?)`/g, '<code>$1</code>'); }
-  const title = (md.match(/^#\s+(.*)$/m) || [, 'Artifact'])[1];
-  fs.writeFileSync(path.join(dir, base + '.html'), '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(title) + '</title><style>body{font:16px/1.55 Georgia,serif;max-width:72ch;margin:40px auto;padding:0 20px;color:#1b2320}table{border-collapse:collapse;margin:1em 0}td,th{border:1px solid #ccd;padding:6px 10px;text-align:left;vertical-align:top}h1,h2,h3{font-family:system-ui,sans-serif;line-height:1.2}code{font-family:Menlo,monospace;font-size:.9em}</style></head><body>' + html + '</body></html>');
-  return { id: base, title, md: '/api/session/' + id + '/artifacts/' + base + '.md', html: '/api/session/' + id + '/artifacts/' + base + '.html', words: md.split(/\s+/).filter(Boolean).length, saved_at: new Date().toISOString() };
+export function main() {
+  openDb();
+  if (!config.apiKey && !config.mockLlm) {
+    console.warn('\n!! ANTHROPIC_API_KEY is not set. Participant messages will fail. Set it, or set MOCK_LLM=1 for the scripted stand-in agent.\n');
+  }
+  if (config.mockLlm) console.warn('MOCK_LLM is on: a scripted stand-in is answering, not Claude.');
+  if (!config.staffEmails.length) console.warn('STAFF_EMAILS is empty: nobody can open the staff dashboard.');
+  startScheduler();
+  const app = createApp();
+  app.listen(config.port, () => console.log(`Cognitive Wedge on ${config.baseUrl}${config.devMode ? ' (dev mode)' : ''}`));
 }
 
-function loginPage(bad) {
-  return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cognitive Wedge</title><style>body{font-family:system-ui,sans-serif;background:#F5F7F5;color:#1B2320;display:grid;place-items:center;min-height:100vh;margin:0}form{background:#fff;border:1px solid #D7DDD8;border-radius:10px;padding:28px;width:min(90vw,340px)}h1{font:500 22px Georgia,serif;margin:0 0 14px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #D7DDD8;border-radius:6px;font-size:16px;margin:6px 0 12px}button{width:100%;padding:10px;background:#1E5E5A;color:#fff;border:0;border-radius:6px;font-size:15px}p{color:#9A2E2E;font-size:13px;margin:0 0 8px}</style></head><body><form method="post" action="/login"><h1>Cognitive Wedge</h1>' + (bad ? '<p>That password was not right.</p>' : '') + '<label>Team password<input type="password" name="password" autofocus required></label><button>Enter</button></form></body></html>';
-}
-
-// ---- static ---------------------------------------------------------------
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.md': 'text/markdown; charset=utf-8', '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8' };
-function sendFile(res, file, download) {
-  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); return res.end('not found'); }
-  const h = { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' };
-  if (download) h['content-disposition'] = 'attachment; filename="' + path.basename(file) + '"';
-  res.writeHead(200, h); fs.createReadStream(file).pipe(res);
-}
-function serveStatic(req, res) {
-  let p = decodeURIComponent(new URL(req.url, 'http://x').pathname); if (p === '/') p = '/index.html';
-  const file = path.normalize(path.join(PUBLIC, p));
-  if (!file.startsWith(PUBLIC)) { res.writeHead(404); return res.end('not found'); }
-  sendFile(res, file);
-}
-
-// ---- router ---------------------------------------------------------------
-http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, 'http://x'); const P = url.pathname;
-    if (P === '/login' && req.method === 'POST') {
-      const body = (await readBody(req, 1e5)).toString('utf8'); const pw = decodeURIComponent((body.match(/(?:^|&)password=([^&]*)/) || [, ''])[1].replace(/\+/g, ' '));
-      if (TEAM_PASSWORD && pw === TEAM_PASSWORD) { res.writeHead(302, { 'set-cookie': 'cw_auth=' + authToken() + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000', location: '/' }); return res.end(); }
-      res.writeHead(302, { location: '/login?bad=1' }); return res.end();
-    }
-    if (P === '/login' || !authed(req)) {
-      if (P.startsWith('/api/')) return json(res, 401, { error: 'sign in first' });
-      res.writeHead(TEAM_PASSWORD ? 200 : 302, TEAM_PASSWORD ? { 'content-type': 'text/html; charset=utf-8' } : { location: '/' });
-      return res.end(TEAM_PASSWORD ? loginPage(url.searchParams.has('bad')) : '');
-    }
-    if (P === '/api/health') return json(res, 200, { ok: true, keySet: !!KEY, models: MODELS, webSearchMaxUses: WEB_SEARCH_MAX_USES });
-    if (P === '/api/sample' && req.method === 'POST') return sample(req, res, JSON.parse((await readBody(req, 5e6)).toString('utf8') || '{}'));
-    if (P === '/api/sessions') return json(res, 200, fs.readdirSync(DATA).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5)));
-    let m;
-    if ((m = P.match(/^\/api\/session\/([^/]+)$/))) {
-      const id = safeId(m[1]); if (!id) return json(res, 400, { error: 'bad id' });
-      if (req.method === 'GET') return sendFile(res, sessionFile(id));
-      if (req.method === 'PUT') { const body = (await readBody(req, 20e6)).toString('utf8'); JSON.parse(body); fs.writeFileSync(sessionFile(id), body); return json(res, 200, { ok: true }); }
-    }
-    if ((m = P.match(/^\/api\/session\/([^/]+)\/documents$/))) {
-      const id = safeId(m[1]); if (!id) return json(res, 400, { error: 'bad id' });
-      if (req.method === 'GET') return json(res, 200, docMeta(id));
-      if (req.method === 'POST') { // body: raw bytes; headers x-file-name, x-file-kind (pdf|docx|text)
-        const name = safeName(decodeURIComponent(req.headers['x-file-name'] || 'document')); const kind = String(req.headers['x-file-kind'] || 'text');
-        const bytes = await readBody(req, 32e6); fs.mkdirSync(sessionDir(id), { recursive: true });
-        const list = docMeta(id); const stamp = Date.now().toString(36);
-        let stored, note = '';
-        if (kind === 'pdf') { stored = stamp + '-' + name; fs.writeFileSync(path.join(sessionDir(id), stored), bytes); }
-        else if (kind === 'docx') { const tmp = path.join(sessionDir(id), stamp + '-' + name); fs.writeFileSync(tmp, bytes); let text; try { text = docxToText(tmp); } catch (e) { return json(res, 415, { error: 'could not read that Word file: ' + e.message }); } stored = stamp + '-' + name + '.txt'; fs.writeFileSync(path.join(sessionDir(id), stored), text); note = 'converted to text'; }
-        else { stored = stamp + '-' + name + (name.endsWith('.txt') || name.endsWith('.md') ? '' : '.txt'); fs.writeFileSync(path.join(sessionDir(id), stored), bytes.toString('utf8')); }
-        const entry = { name, kind: kind === 'pdf' ? 'pdf' : 'text', stored, bytes: bytes.length, note, added_at: new Date().toISOString() };
-        list.push(entry); saveDocMeta(id, list); return json(res, 200, entry);
-      }
-    }
-    if ((m = P.match(/^\/api\/session\/([^/]+)\/artifacts$/)) && req.method === 'POST') {
-      const id = safeId(m[1]); if (!id) return json(res, 400, { error: 'bad id' });
-      return json(res, 200, saveArtifact(id, JSON.parse((await readBody(req, 5e6)).toString('utf8') || '{}')));
-    }
-    if ((m = P.match(/^\/api\/session\/([^/]+)\/artifacts\/([^/]+)$/))) {
-      const id = safeId(m[1]); const f = safeName(m[2]); if (!id) return json(res, 400, { error: 'bad id' });
-      return sendFile(res, path.join(sessionDir(id), 'artifacts', f), url.searchParams.has('download'));
-    }
-    return serveStatic(req, res);
-  } catch (e) { console.error(e); json(res, 500, { error: e.message }); }
-}).listen(PORT, HOST, () => {
-  console.log('Cognitive Wedge running at http://' + (HOST === '0.0.0.0' ? '0.0.0.0' : 'localhost') + ':' + PORT + (TEAM_PASSWORD ? '  (team password on)' : '') + (KEY ? '' : '   (ANTHROPIC_API_KEY not set)'));
-  console.log('Models: agent=' + MODELS.default + '  classifier=' + MODELS.quick + '  web search: up to ' + WEB_SEARCH_MAX_USES + ' per turn  records → ' + DATA);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

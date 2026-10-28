@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Staff sign-in · Cognitive Wedge</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<main class="wrap narrow">
+  <h1>Staff sign-in</h1>
+  <p class="lede">Program staff only. We will email you a one-time link that signs you in for 8 hours.</p>
+  <form id="f" class="card">
+    <label for="email">Staff email</label>
+    <input id="email" type="email" required autocomplete="email">
+    <button type="submit">Send sign-in link</button>
+    <p id="msg" class="note" role="status"></p>
+  </form>
+</main>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await fetch('/api/staff/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: document.getElementById('email').value }) });
+  const j = await r.json();
+  document.getElementById('msg').innerHTML = 'If that address is on the staff list, a link is on its way.' + (j.devLink ? ` <br>Dev mode: <a href="${j.devLink}">sign in</a>.` : '');
+});
+</script>
+</body>
+</html>
